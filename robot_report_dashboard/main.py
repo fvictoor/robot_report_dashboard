@@ -6,6 +6,7 @@ import datetime
 from collections import defaultdict
 from robot.api import ExecutionResult, ResultVisitor
 import argparse
+import json
 
 class ModelCollector(ResultVisitor):
     def __init__(self):
@@ -59,81 +60,119 @@ def extract_results(path):
     execution_date = datetime.datetime.strptime(result.suite.starttime, "%Y%m%d %H:%M:%S.%f").strftime("%d/%m/%Y")
     return collector.tests, total_elapsed_time, execution_date
 
-# MELHORIA 1: A função agora aceita também o nome do arquivo (filename)
 def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, output_dir, filename):
     df_main = pd.DataFrame(tests1)
     df_rerun = pd.DataFrame(tests2)
 
+    # Lógica de Falhas
     initial_failures_df = df_main[df_main['status'] == 'FAIL']
     failed_rerun_df = df_rerun[df_rerun['status'] == 'FAIL']
     permanent_failures_df = pd.merge(initial_failures_df, failed_rerun_df, on='name', how='inner')
     permanent_failure_names = set(permanent_failures_df['name'])
 
+    total_tests = len(df_main)
+    initial_failures = len(initial_failures_df)
+    final_failures = len(permanent_failure_names)
+    recovered = initial_failures - final_failures
+    total_passed = total_tests - initial_failures
+
+    # --- AGREGAÇÃO DE DADOS PARA GRÁFICOS ---
+
+    # 1. Dados para o gráfico de Rosca (Status Geral)
+    status_distribution = {
+        "labels": ["Aprovados", "Recuperados", "Falhas Definitivas"],
+        "data": [total_passed, recovered, final_failures]
+    }
+
+    # 2. Dados para o gráfico de Barras (Resultados por Tag)
+    tag_results = defaultdict(lambda: {'passed': 0, 'failed': 0})
+    for test in tests1:
+        is_permanent_failure = test['name'] in permanent_failure_names
+        status_for_tag = 'failed' if test['status'] == 'FAIL' and is_permanent_failure else 'passed'
+        for tag in test['tags']:
+            if tag in tags_to_track:
+                if status_for_tag == 'passed':
+                    tag_results[tag]['passed'] += 1
+                else:
+                    tag_results[tag]['failed'] += 1
+
+    tag_chart_data = {
+        "labels": tags_to_track,
+        "passed_data": [tag_results[tag]['passed'] for tag in tags_to_track],
+        "failed_data": [tag_results[tag]['failed'] for tag in tags_to_track]
+    }
+
+    # 3. Dados para o gráfico de Tempo por Suíte
+    suite_times = defaultdict(float)
+    for test in tests1:
+        suite_times[test['suite']] += test['elapsed']
+    
+    suite_time_data_sorted = sorted(suite_times.items(), key=lambda item: item[1], reverse=True)
+    suite_time_chart_data = {
+        "labels": [item[0] for item in suite_time_data_sorted],
+        "data": [item[1] for item in suite_time_data_sorted],
+        "formatted_times": [format_seconds_to_hms(item[1]) for item in suite_time_data_sorted]
+    }
+
+    # 4. Dados para o gráfico de Tempo por Tag
+    tag_times = defaultdict(float)
+    for test in tests1:
+        for tag in test['tags']:
+            if tag in tags_to_track:
+                tag_times[tag] += test['elapsed']
+                
+    tag_time_data_filtered = {tag: tag_times[tag] for tag in tags_to_track if tag in tag_times}
+    tag_time_data_sorted = sorted(tag_time_data_filtered.items(), key=lambda item: item[1], reverse=True)
+    tag_time_chart_data = {
+        "labels": [item[0] for item in tag_time_data_sorted],
+        "data": [item[1] for item in tag_time_data_sorted],
+        "formatted_times": [format_seconds_to_hms(item[1]) for item in tag_time_data_sorted]
+    }
+
+    # --- PREPARAÇÃO DOS DADOS PARA A PÁGINA DE DETALHES ---
+    
     test_details_by_suite = defaultdict(list)
     for test in tests1:
+        final_status = 'PASS'
+        if test['name'] in permanent_failure_names:
+            final_status = 'FAIL'
+        
         test_details_by_suite[test["suite"]].append({
-            "name": test["name"], "status": test["status"], "elapsed": format_seconds_to_hms(test["elapsed"]),
+            "name": test["name"], "status": final_status, "elapsed": format_seconds_to_hms(test["elapsed"]),
             "tags": test["tags"], "doc": test["doc"], "message": test["message"]
         })
 
     suite_list_for_template = []
     for suite_name, tests in test_details_by_suite.items():
-        has_failures = any(test['name'] in permanent_failure_names for test in tests)
+        has_failures = any(test['status'] == 'FAIL' for test in tests)
         suite_list_for_template.append({
-            "name": suite_name,
-            "tests": tests,
-            "has_failures": has_failures
+            "name": suite_name, "tests": tests, "has_failures": has_failures
         })
-
-    total_tests = len(df_main)
-    initial_failures = len(initial_failures_df)
-    total_passed = total_tests - initial_failures
-    final_failures = len(permanent_failure_names)
-    recovered = initial_failures - final_failures
     
-    suite_counts = defaultdict(int)
-    suite_times = defaultdict(float)
-    for test in tests1:
-        suite = test["suite"]
-        suite_counts[suite] += 1
-        suite_times[suite] += test["elapsed"]
-
-    suite_data = [{"suite": s, "count": c, "time": suite_times[s]} for s, c in suite_counts.items()]
-    for s_data in suite_data:
-        s_data['time_hms'] = format_seconds_to_hms(s_data['time'])
-    suite_data_sorted_by_time = sorted(suite_data, key=lambda x: x['time'], reverse=True)
-
-    tag_counts = defaultdict(int)
-    tag_times = defaultdict(float)
-    for test in tests1:
-        for tag in test['tags']:
-            if tag in tags_to_track:
-                tag_counts[tag] += 1
-                tag_times[tag] += test['elapsed']
-
-    tag_count_data = [{"tag": tag, "count": tag_counts.get(tag, 0)} for tag in tags_to_track]
-
-    tag_time_data = [{"tag": tag, "time": tag_times.get(tag, 0)} for tag in tags_to_track]
-    for t_data in tag_time_data:
-        t_data['time_hms'] = format_seconds_to_hms(t_data['time'])
-    tag_time_data_sorted = sorted(tag_time_data, key=lambda x: x['time'], reverse=True)
+    # --- RENDERIZAÇÃO DO TEMPLATE ---
 
     template_dir = os.path.join(os.path.dirname(__file__), "templates")
     env = Environment(loader=FileSystemLoader(template_dir))
-    template = env.get_template("report_template.html")
+    template = env.get_template("modern_report_template.html")
     
     html = template.render(
+        # Dados do Resumo
         total_tests=total_tests, total_passed=total_passed, initial_failures=initial_failures,
         recovered=recovered, final_failures=final_failures, total_execution_time=format_seconds_to_hms(total_time1),
-        execution_date=exec_date1, suite_data=suite_data, suite_data_sorted_by_time=suite_data_sorted_by_time,
-        tag_count_data=tag_count_data,
-        tag_time_data_sorted=tag_time_data_sorted,
+        execution_date=exec_date1,
+        
+        # Dados para Gráficos (convertidos para JSON)
+        status_distribution_json=json.dumps(status_distribution),
+        tag_chart_data_json=json.dumps(tag_chart_data),
+        suite_time_chart_data_json=json.dumps(suite_time_chart_data),
+        tag_time_chart_data_json=json.dumps(tag_time_chart_data),
+        
+        # Dados para a lista de detalhes
         suite_list=suite_list_for_template
     )
 
     os.makedirs(output_dir, exist_ok=True)
     
-    # MELHORIA 2: Garante que a extensão .html seja adicionada se não for fornecida
     if not filename.lower().endswith('.html'):
         filename += '.html'
         
@@ -142,11 +181,12 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
         
-    print(f"✅ Relatório gerado: {os.path.abspath(output_path)}")
+    print(f"✅ Dashboard customizado gerado: {os.path.abspath(output_path)}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Gera um dashboard HTML a partir de resultados do Robot Framework.",
+        description="Gera um dashboard HTML moderno a partir de resultados do Robot Framework.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('output_xml', help='Caminho para o arquivo output.xml principal.')
@@ -161,11 +201,10 @@ if __name__ == "__main__":
         help='Pasta de destino para o arquivo de relatório.\nO padrão é o diretório atual.\nExemplo: "C:\\Relatorios"',
         default='.'
     )
-    # MELHORIA 3: Novo argumento para definir o nome do arquivo
     parser.add_argument(
         '--filename',
-        help='Nome do arquivo de relatório HTML gerado.\nO padrão é "report.html".\nExemplo: "meu_relatorio.html"',
-        default='report.html'
+        help='Nome do arquivo HTML gerado.\nO padrão é "dashboard_customizado.html".\nExemplo: "meu_relatorio.html"',
+        default='dashboard_customizado.html' # ALTERAÇÃO PARA GARANTIR SEGURANÇA
     )
 
     args = parser.parse_args()
@@ -175,15 +214,10 @@ if __name__ == "__main__":
     try:
         tests_main, total_time_main, exec_date_main = extract_results(args.output_xml)
         tests_rerun, _, _ = extract_results(args.rerun_xml)
-        # Passa todos os argumentos para a função
+        
         generate_dashboard(
-            tests_main, 
-            total_time_main, 
-            exec_date_main, 
-            tests_rerun, 
-            tags_list, 
-            args.output_dir, 
-            args.filename
+            tests_main, total_time_main, exec_date_main, 
+            tests_rerun, tags_list, args.output_dir, args.filename
         )
     except Exception as e:
         print(f"❌ Erro ao gerar relatório: {e}")
