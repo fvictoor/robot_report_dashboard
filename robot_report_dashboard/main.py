@@ -60,21 +60,29 @@ def extract_results(path):
     execution_date = datetime.datetime.strptime(result.suite.starttime, "%Y%m%d %H:%M:%S.%f").strftime("%d/%m/%Y")
     return collector.tests, total_elapsed_time, execution_date
 
-def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, output_dir, filename):
+def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, output_dir, filename, has_rerun_file):
     df_main = pd.DataFrame(tests1)
-    df_rerun = pd.DataFrame(tests2)
-
-    # Lógica de Falhas
-    initial_failures_df = df_main[df_main['status'] == 'FAIL']
-    failed_rerun_df = df_rerun[df_rerun['status'] == 'FAIL']
-    permanent_failures_df = pd.merge(initial_failures_df, failed_rerun_df, on='name', how='inner')
-    permanent_failure_names = set(permanent_failures_df['name'])
-
+    
     total_tests = len(df_main)
+    initial_failures_df = df_main[df_main['status'] == 'FAIL']
     initial_failures = len(initial_failures_df)
-    final_failures = len(permanent_failure_names)
-    recovered = initial_failures - final_failures
     total_passed = total_tests - initial_failures
+
+    # Lógica de Falhas Atualizada
+    if has_rerun_file:
+        # Se o arquivo de rerun existe, calcula a recuperação
+        df_rerun = pd.DataFrame(tests2)
+        failed_rerun_df = df_rerun[df_rerun['status'] == 'FAIL']
+        permanent_failures_df = pd.merge(initial_failures_df, failed_rerun_df, on='name', how='inner')
+        permanent_failure_names = set(permanent_failures_df['name'])
+        final_failures = len(permanent_failure_names)
+        recovered = initial_failures - final_failures
+    else:
+        # Se não há arquivo de rerun, não há recuperados e as falhas iniciais são as finais
+        recovered = 0
+        final_failures = initial_failures
+        permanent_failure_names = set(initial_failures_df['name'])
+
 
     # --- AGREGAÇÃO DE DADOS PARA GRÁFICOS ---
 
@@ -204,7 +212,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--filename',
         help='Nome do arquivo HTML gerado.\nO padrão é "dashboard_customizado.html".\nExemplo: "meu_relatorio.html"',
-        default='dashboard_customizado.html' # ALTERAÇÃO PARA GARANTIR SEGURANÇA
+        default='dashboard_customizado.html'
     )
 
     args = parser.parse_args()
@@ -212,12 +220,29 @@ if __name__ == "__main__":
     tags_list = [tag.strip() for tag in args.tags.split(',') if tag.strip()]
 
     try:
+        # O arquivo principal ainda é obrigatório
         tests_main, total_time_main, exec_date_main = extract_results(args.output_xml)
-        tests_rerun, _, _ = extract_results(args.rerun_xml)
         
+        # Lógica de verificação do arquivo de rerun
+        tests_rerun = []
+        has_rerun_file = os.path.exists(args.rerun_xml)
+
+        if has_rerun_file:
+            tests_rerun, _, _ = extract_results(args.rerun_xml)
+        else:
+            # Exibe a mensagem de aviso no console
+            print(f"⚠️  Atenção: O arquivo de rerun '{args.rerun_xml}' não foi encontrado.")
+            print("         O dashboard será gerado sem a análise de recuperação de falhas.")
+
         generate_dashboard(
-            tests_main, total_time_main, exec_date_main, 
-            tests_rerun, tags_list, args.output_dir, args.filename
+            tests_main, 
+            total_time_main, 
+            exec_date_main, 
+            tests_rerun, 
+            tags_list, 
+            args.output_dir, 
+            args.filename,
+            has_rerun_file  # Passa a nova flag para a função
         )
     except Exception as e:
         print(f"❌ Erro ao gerar relatório: {e}")
