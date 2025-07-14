@@ -7,6 +7,7 @@ from collections import defaultdict
 from robot.api import ExecutionResult, ResultVisitor
 import argparse
 import json
+import xml.etree.ElementTree as ET
 
 class ModelCollector(ResultVisitor):
     def __init__(self):
@@ -52,7 +53,6 @@ def time_diff(start, end):
 def extract_results(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Arquivo não encontrado: {path}")
-
     result = ExecutionResult(path)
     collector = ModelCollector()
     result.visit(collector)
@@ -60,7 +60,63 @@ def extract_results(path):
     execution_date = datetime.datetime.strptime(result.suite.starttime, "%Y%m%d %H:%M:%S.%f").strftime("%d/%m/%Y")
     return collector.tests, total_elapsed_time, execution_date
 
-def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, output_dir, filename, has_rerun_file):
+def extract_config_info(xml_path):
+    config_info = {
+        "browser": "Não encontrado",
+        "resolution": "Não encontrada",
+        "frontend_url": "Não encontrada",
+        "backend_url": "Não encontrada"
+    }
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        # Encontra o browser e a resolução
+        for msg in root.findall(".//kw[@name='New Context']/msg[@level='INFO']"):
+            if 'viewport' in msg.text:
+                try:
+                    data = json.loads(msg.text)
+                    if 'viewport' in data and 'width' in data['viewport'] and 'height' in data['viewport']:
+                        vp = data['viewport']
+                        config_info['resolution'] = f"{vp['width']}x{vp['height']}"
+                    if 'browser' in data:
+                        config_info['browser'] = data.get('browser', config_info['browser'])
+                    break 
+                except json.JSONDecodeError:
+                    continue
+        
+        for msg in root.findall(".//kw[@name='New Browser']/msg[@level='INFO']"):
+             if 'browser' in msg.text:
+                try:
+                    data = json.loads(msg.text)
+                    if 'browser' in data:
+                         config_info['browser'] = data['browser']
+                         break
+                except json.JSONDecodeError:
+                    continue
+
+        # Encontra URL de Frontend (LÓGICA CORRIGIDA)
+        for msg in root.findall(".//kw[@name='New Page']/msg"):
+            if 'opened url:' in msg.text:
+                url_part = msg.text.split(' ')[-1]
+                base_url = "/".join(url_part.split('/')[:3])
+                config_info['frontend_url'] = base_url
+                break
+
+        # Encontra URL de Backend
+        for msg in root.findall(".//kw[@owner='RequestsLibrary']/msg"):
+            if 'Request : url=' in msg.text:
+                url_part = msg.text.split('url=')[1].strip()
+                base_url = "/".join(url_part.split('/')[:3])
+                config_info['backend_url'] = base_url
+                break
+                
+    except Exception:
+        pass
+        
+    return config_info
+
+def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, output_dir, filename, has_rerun_file, config_info):
     df_main = pd.DataFrame(tests1)
     
     total_tests = len(df_main)
@@ -68,9 +124,7 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
     initial_failures = len(initial_failures_df)
     total_passed = total_tests - initial_failures
 
-    # Lógica de Falhas Atualizada
     if has_rerun_file:
-        # Se o arquivo de rerun existe, calcula a recuperação
         df_rerun = pd.DataFrame(tests2)
         failed_rerun_df = df_rerun[df_rerun['status'] == 'FAIL']
         permanent_failures_df = pd.merge(initial_failures_df, failed_rerun_df, on='name', how='inner')
@@ -78,21 +132,15 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
         final_failures = len(permanent_failure_names)
         recovered = initial_failures - final_failures
     else:
-        # Se não há arquivo de rerun, não há recuperados e as falhas iniciais são as finais
         recovered = 0
         final_failures = initial_failures
         permanent_failure_names = set(initial_failures_df['name'])
 
-
-    # --- AGREGAÇÃO DE DADOS PARA GRÁFICOS ---
-
-    # 1. Dados para o gráfico de Rosca (Status Geral)
     status_distribution = {
         "labels": ["Aprovados", "Recuperados", "Falhas Definitivas"],
         "data": [total_passed, recovered, final_failures]
     }
 
-    # 2. Dados para o gráfico de Barras (Resultados por Tag)
     tag_results = defaultdict(lambda: {'passed': 0, 'failed': 0})
     for test in tests1:
         is_permanent_failure = test['name'] in permanent_failure_names
@@ -110,7 +158,6 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
         "failed_data": [tag_results[tag]['failed'] for tag in tags_to_track]
     }
 
-    # 3. Dados para o gráfico de Tempo por Suíte
     suite_times = defaultdict(float)
     for test in tests1:
         suite_times[test['suite']] += test['elapsed']
@@ -122,7 +169,6 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
         "formatted_times": [format_seconds_to_hms(item[1]) for item in suite_time_data_sorted]
     }
 
-    # 4. Dados para o gráfico de Tempo por Tag
     tag_times = defaultdict(float)
     for test in tests1:
         for tag in test['tags']:
@@ -137,8 +183,6 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
         "formatted_times": [format_seconds_to_hms(item[1]) for item in tag_time_data_sorted]
     }
 
-    # --- PREPARAÇÃO DOS DADOS PARA A PÁGINA DE DETALHES ---
-    
     test_details_by_suite = defaultdict(list)
     for test in tests1:
         final_status = 'PASS'
@@ -157,26 +201,20 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
             "name": suite_name, "tests": tests, "has_failures": has_failures
         })
     
-    # --- RENDERIZAÇÃO DO TEMPLATE ---
-
     template_dir = os.path.join(os.path.dirname(__file__), "templates")
     env = Environment(loader=FileSystemLoader(template_dir))
     template = env.get_template("modern_report_template.html")
     
     html = template.render(
-        # Dados do Resumo
         total_tests=total_tests, total_passed=total_passed, initial_failures=initial_failures,
         recovered=recovered, final_failures=final_failures, total_execution_time=format_seconds_to_hms(total_time1),
         execution_date=exec_date1,
-        
-        # Dados para Gráficos (convertidos para JSON)
         status_distribution_json=json.dumps(status_distribution),
         tag_chart_data_json=json.dumps(tag_chart_data),
         suite_time_chart_data_json=json.dumps(suite_time_chart_data),
         tag_time_chart_data_json=json.dumps(tag_time_chart_data),
-        
-        # Dados para a lista de detalhes
-        suite_list=suite_list_for_template
+        suite_list=suite_list_for_template,
+        config_info=config_info
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -189,7 +227,7 @@ def generate_dashboard(tests1, total_time1, exec_date1, tests2, tags_to_track, o
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
         
-    print(f"✅ Dashboard customizado gerado: {os.path.abspath(output_path)}")
+    print(f"Dashboard customizado gerado: {os.path.abspath(output_path)}")
 
 
 if __name__ == "__main__":
@@ -220,18 +258,17 @@ if __name__ == "__main__":
     tags_list = [tag.strip() for tag in args.tags.split(',') if tag.strip()]
 
     try:
-        # O arquivo principal ainda é obrigatório
         tests_main, total_time_main, exec_date_main = extract_results(args.output_xml)
         
-        # Lógica de verificação do arquivo de rerun
+        config_info = extract_config_info(args.output_xml)
+
         tests_rerun = []
         has_rerun_file = os.path.exists(args.rerun_xml)
 
         if has_rerun_file:
             tests_rerun, _, _ = extract_results(args.rerun_xml)
         else:
-            # Exibe a mensagem de aviso no console
-            print(f"⚠️  Atenção: O arquivo de rerun '{args.rerun_xml}' não foi encontrado.")
+            print(f"Atenção: O arquivo de rerun '{args.rerun_xml}' não foi encontrado.")
             print("         O dashboard será gerado sem a análise de recuperação de falhas.")
 
         generate_dashboard(
@@ -242,8 +279,9 @@ if __name__ == "__main__":
             tags_list, 
             args.output_dir, 
             args.filename,
-            has_rerun_file  # Passa a nova flag para a função
+            has_rerun_file,
+            config_info
         )
     except Exception as e:
-        print(f"❌ Erro ao gerar relatório: {e}")
+        print(f"Erro ao gerar relatório: {e}")
         sys.exit(1)
