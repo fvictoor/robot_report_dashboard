@@ -1,3 +1,5 @@
+![Dashboard demo](https://github.com/fvictoor/robot_report_dashboard/blob/main/dashboard.gif?raw=true)
+
 # 🤖 Robot Framework Dashboard Generator
 
 Bem-vindo ao **Robot Framework Dashboard Generator**!
